@@ -1,0 +1,12 @@
+name = "data-api"
+main = "data-api-worker.js"
+compatibility_date = "2024-01-01"
+
+[[kv_namespaces]]
+binding = "DATA"
+id = "YOUR_KV_NAMESPACE_ID"
+
+# Uncomment and update after you know your domain:
+# routes = [
+#   { pattern = "yourdomain.com/api/data", custom_domain = false }
+# ]

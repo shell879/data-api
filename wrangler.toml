@@ -2,11 +2,16 @@ name = "data-api"
 main = "data-api-worker.js"
 compatibility_date = "2024-01-01"
 
+routes = [
+  { pattern = "shelldesignz.com/api/data", custom_domain = false },
+  { pattern = "shelldesignz.com/api/christmas", custom_domain = false },
+  { pattern = "shelldesignz.com/api/scan", zone_name = "shelldesignz.com" },
+  { pattern = "shelldesignz.com/api/identify", zone_name = "shelldesignz.com" }
+]
+
 [[kv_namespaces]]
 binding = "DATA"
-id = "YOUR_KV_NAMESPACE_ID"
+id = "79e14dc891024a32bab50a92dd250a3e"
 
-# Uncomment and update after you know your domain:
-# routes = [
-#   { pattern = "yourdomain.com/api/data", custom_domain = false }
-# ]
+[ai]
+binding = "AI"

@@ -10,7 +10,8 @@
 //   • /api/join-store  — Add a shared store to a user's account
 //   • /api/switch-store — Change the user's active store
 //   • /api/my-stores   — List all stores a user has access to
-//   • /api/christmas   — GET/POST per-user recipe data (scoped by store)
+//   • /api/christmas   — GET/POST per-user recipe data shared by the
+//                        Christmas and MyNutrition pages (scoped by store)
 //   • /api/data        — GET/POST shared app data (global, not per-user)
 //
 // Data is stored in Workers KV (env.DATA), keyed as:
@@ -98,13 +99,15 @@ export default {
       return handleMyStores(request, env, ctx);
     }
 
-    // ── Route: Data storage (christmas + shared) ─────────────
-    // GET/POST /api/christmas → per-user recipe data (scoped by storeId)
+    // ── Route: Data storage (store recipes + shared catalog) ─
+    // GET/POST /api/christmas → per-user store recipes used by both the
+    // Christmas and MyNutrition pages. These are two views of the same data,
+    // not separate KV datasets.
     // GET/POST /api/data      → shared global app data
     //
     // For /api/christmas, we look up the user's active store and
-    // use the key "store:<storeId>:christmasData". This keeps each
-    // user's recipe data isolated by store.
+    // use "store:<storeId>:christmasData". The URL name is historical;
+    // the key is shared by both page experiences and isolated by store.
     //
     // For everything else (e.g., /api/data), we use the shared
     // "appData" key — this is global data not tied to a specific user.

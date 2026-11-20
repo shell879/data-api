@@ -59,12 +59,15 @@ export default {
 
     // ── Route: Food identification ───────────────────────────
     // POST /api/identify
-    // Accepts a multipart/form-data upload with a "file" field (food photo).
+    // Accepts a food photo as multipart/form-data, or JSON with a recipe name.
     // Step 1: Vision model identifies the food in 1-3 words.
     // Step 2: Text LLM generates a full recipe (ingredients + instructions).
     // Returns a structured recipe object.
     // Routed through AI Gateway for caching and spend tracking.
     if (url.pathname === "/api/identify" && request.method === "POST") {
+      if ((request.headers.get("Content-Type") || "").toLowerCase().startsWith("application/json")) {
+        return handleRecipeName(request, env, ctx);
+      }
       return handleIdentify(request, env, ctx);
     }
 
@@ -704,8 +707,8 @@ async function handleScan(request, env, ctx) {
 //     Example: "orange cake", "chocolate chip cookies", "pepperoni pizza"
 //
 //   Step 2 — Text LLM (llama-3.1-8b-instruct-fast):
-//     Takes the food name from step 1 and generates a full recipe
-//     with INGREDIENTS and INSTRUCTIONS sections.
+//     Takes the food description from step 1 and generates a short
+//     recipe title plus INGREDIENTS and INSTRUCTIONS sections.
 //
 // Both AI calls are routed through the AI Gateway with caching
 // (1 hour TTL) and user_id metadata for spend tracking.
@@ -781,10 +784,57 @@ async function handleIdentify(request, env, ctx) {
 
     // Extract the food name from the vision model's response
     const foodDescription = visionResult.response || visionResult.result || "unknown food";
+    return await generateRecipe(foodDescription, email, env, foodDescription);
+  } catch (err) {
+    return Response.json(
+      { error: "Identification failed", message: err.message },
+      { status: 500, headers: { "Access-Control-Allow-Origin": "*" } }
+    );
+  }
+}
+
+// JSON requests use the same routed endpoint and recipe generator as food photos.
+async function handleRecipeName(request, env, ctx) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return Response.json(
+      { error: "Enter a valid recipe name." },
+      { status: 400, headers: { "Access-Control-Allow-Origin": "*" } }
+    );
+  }
+  const description = typeof body?.name === "string" ? body.name.trim() : "";
+  if (!description || description.length > 200) {
+    return Response.json(
+      { error: "Enter a recipe name of 1 to 200 characters." },
+      { status: 400, headers: { "Access-Control-Allow-Origin": "*" } }
+    );
+  }
+
+  try {
+    const email = await getEmail(env, ctx, request);
+    if (!email) {
+      return Response.json(
+        { error: "User not found" },
+        { status: 404, headers: { "Access-Control-Allow-Origin": "*" } }
+      );
+    }
+    return await generateRecipe(description, email, env);
+  } catch (err) {
+    return Response.json(
+      { error: "Recipe generation failed", message: err.message },
+      { status: 500, headers: { "Access-Control-Allow-Origin": "*" } }
+    );
+  }
+}
+
+async function generateRecipe(foodDescription, email, env, identified) {
 
     // ── Step 2: Text LLM generates the recipe ───────────────
-    // Given the food name from step 1, the text model writes a
-    // full recipe with two labeled sections:
+    // Given the vision description, the text model writes a short
+    // title and a full recipe with labeled sections:
+    //   NAME — a short recipe title, not a description or sentence
     //   INGREDIENTS — each ingredient on its own line
     //   INSTRUCTIONS — each step on its own line
     //
@@ -797,7 +847,7 @@ async function handleIdentify(request, env, ctx) {
           {
             role: "system",
             content:
-              "You are a recipe generator. Given a food description, write a complete recipe. Output two sections labeled exactly INGREDIENTS and INSTRUCTIONS. Under INGREDIENTS, list each ingredient on its own line. Under INSTRUCTIONS, list each step on its own line. Do not include anything else — no author, no source, no commentary, no sub-recipes.",
+              "You are a recipe generator. Given a food description, write a complete recipe. Start with NAME: followed on the same line by a short recipe title of 1 to 10 words, not a sentence or description. Then output two sections labeled exactly INGREDIENTS and INSTRUCTIONS. Under INGREDIENTS, list each ingredient on its own line. Under INSTRUCTIONS, list each step on its own line. Do not include anything else — no author, no source, no commentary, no sub-recipes.",
           },
           { role: "user", content: `Write a recipe for: ${foodDescription}` },
         ],
@@ -823,19 +873,32 @@ async function handleIdentify(request, env, ctx) {
     const raw = recipeResult.response || recipeResult.result || "";
 
     // Find the section headers (case-insensitive)
-    const upperRaw = raw.toUpperCase();
-    const ingStart = upperRaw.indexOf("INGREDIENTS");
-    const instrStart = upperRaw.indexOf("INSTRUCTIONS");
+    const ingHeader = /^[ \t]*(?:\*\*)?INGREDIENTS(?:\*\*)?[ \t]*:?(?:\*\*)?[ \t]*$/im.exec(raw);
+    const instrHeader = /^[ \t]*(?:\*\*)?INSTRUCTIONS(?:\*\*)?[ \t]*:?(?:\*\*)?[ \t]*$/im.exec(raw);
+    const titleMatch = raw.match(/^[ \t]*(?:\*\*)?NAME(?:\*\*)?[ \t]*:(?:\*\*)?[ \t]*(?:\*\*)?([^\r\n*]+?)(?:\*\*)?[ \t]*$/im);
+    const title = titleMatch?.[1].trim().replace(/[.!?]+$/, "").trim();
+    if (!title || title.split(/\s+/).length > 10 || /^(?:this|the image|the photo|the picture|i (?:see|think|can))\b/i.test(title)) {
+      return Response.json(
+        { error: "Could not determine a short recipe name. Please try again." },
+        { status: 502, headers: { "Access-Control-Allow-Origin": "*" } }
+      );
+    }
+    if (!ingHeader || !instrHeader || titleMatch.index > ingHeader.index || ingHeader.index >= instrHeader.index) {
+      return Response.json(
+        { error: "Could not read the generated ingredients and instructions. Please try again." },
+        { status: 502, headers: { "Access-Control-Allow-Origin": "*" } }
+      );
+    }
 
     let ingredients = [];
     let instructions = [];
 
-    if (ingStart !== -1 && instrStart !== -1 && ingStart < instrStart) {
+    {
       // ── Normal case: both headers found ──────────────────
       // Extract text between INGREDIENTS and INSTRUCTIONS,
       // then text after INSTRUCTIONS.
-      const ingText = raw.slice(ingStart + 12, instrStart).trim();
-      const instrText = raw.slice(instrStart + 13).trim();
+      const ingText = raw.slice(ingHeader.index + ingHeader[0].length, instrHeader.index).trim();
+      const instrText = raw.slice(instrHeader.index + instrHeader[0].length).trim();
 
       // Parse ingredients: split by line, clean up formatting
       ingredients = ingText
@@ -854,12 +917,12 @@ async function handleIdentify(request, env, ctx) {
         .filter((l) => l && !/^instructions?\s*:?\s*$/i.test(l))
         .map((l) => l.replace(/^[\*\-•\u2022]\s*/, "").trim())
         .filter((l) => l.length > 1);
-    } else {
-      // ── Fallback: no section headers found ───────────────
-      // Treat all lines as ingredients. This handles cases where
-      // the model didn't follow the format instructions.
-      const lines = raw.split("\n").map((l) => l.trim()).filter((l) => l.length > 1);
-      ingredients = lines;
+    }
+    if (!ingredients.length || !instructions.length) {
+      return Response.json(
+        { error: "The generated recipe is missing ingredients or instructions. Please try again." },
+        { status: 502, headers: { "Access-Control-Allow-Origin": "*" } }
+      );
     }
 
     // ── Build the recipe object ────────────────────────────
@@ -872,8 +935,8 @@ async function handleIdentify(request, env, ctx) {
     const recipe = {
       id: Date.now(),
       storeId: null,
-      name: foodDescription.split(".")[0].trim() || "Unknown",
-      identified: foodDescription,
+      name: title,
+      ...(identified !== undefined ? { identified } : {}),
       categoryId: null,
       ingredients: [
         // Ingredients → side: "TOP"
@@ -899,10 +962,4 @@ async function handleIdentify(request, env, ctx) {
     return Response.json(recipe, {
       headers: { "Access-Control-Allow-Origin": "*" },
     });
-  } catch (err) {
-    return Response.json(
-      { error: "Identification failed", message: err.message },
-      { status: 500, headers: { "Access-Control-Allow-Origin": "*" } }
-    );
-  }
 }

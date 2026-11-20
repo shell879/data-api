@@ -21,5 +21,10 @@ into an existing store, replace `STORE_ID` with that store's ID:
 wrangler kv key put --namespace-id=YOUR_ID "store:STORE_ID:christmasData" --path=./christmas.json
 ```
 
+`POST /api/identify` also accepts JSON such as `{"name":"cherry cake"}` to
+generate a suggested recipe from a dish name. Food-photo uploads continue to
+use multipart form data. Both use the AI Gateway's per-user tracking; generated
+recipes should be reviewed before saving and may not match a restaurant's original.
+
 The root `christmas.json` file is only an import/local-data source; changing it
 does not automatically update any store in KV.

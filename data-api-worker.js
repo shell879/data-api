@@ -46,7 +46,13 @@ export default {
       });
     }
 
-    if (["/api/christmas", "/api/my-stores", "/api/join-store", "/api/switch-store"].includes(url.pathname)) {
+    const storeRoutes = ["/api/christmas", "/api/my-stores", "/api/join-store", "/api/switch-store"];
+    if (!storeRoutes.includes(url.pathname) && storeRoutes.some((route) => url.pathname.startsWith(route))) {
+      return Response.json({ error: "Not found" }, {
+        status: 404, headers: { "Access-Control-Allow-Origin": "*" },
+      });
+    }
+    if (storeRoutes.includes(url.pathname)) {
       const app = url.searchParams.get("app");
       if (app !== "recipeBuilder" && app !== "myNutrition") {
         return Response.json(

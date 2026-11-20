@@ -4,9 +4,13 @@ compatibility_date = "2024-01-01"
 
 routes = [
   { pattern = "shelldesignz.com/api/data", custom_domain = false },
-  { pattern = "shelldesignz.com/api/christmas", custom_domain = false },
+  { pattern = "shelldesignz.com/api/christmas*", custom_domain = false },
   { pattern = "shelldesignz.com/api/scan", zone_name = "shelldesignz.com" },
-  { pattern = "shelldesignz.com/api/identify", zone_name = "shelldesignz.com" }
+  { pattern = "shelldesignz.com/api/identify", zone_name = "shelldesignz.com" },
+  { pattern = "shelldesignz.com/api/join-store*", zone_name = "shelldesignz.com" },
+  { pattern = "shelldesignz.com/api/switch-store*", zone_name = "shelldesignz.com" },
+  { pattern = "shelldesignz.com/api/my-stores*", zone_name = "shelldesignz.com" }
+
 ]
 
 [[kv_namespaces]]

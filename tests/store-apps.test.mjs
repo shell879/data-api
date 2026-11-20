@@ -83,3 +83,13 @@ test("migrates legacy single-store records", async () => {
   assert.equal(list.data.stores[0].active, true);
   assert.equal(list.data.stores[0].owned, true);
 });
+
+test("wildcard routes do not expose unrelated paths as global data", async () => {
+  const { records, call } = setup();
+  records.set("appData", JSON.stringify({ existing: true }));
+  for (const route of ["christmas", "my-stores", "join-store", "switch-store"]) {
+    assert.equal((await call("alex@example.invalid", `${route}-extra`)).status, 404);
+    assert.equal((await call("alex@example.invalid", `${route}-extra`, { replacement: true })).status, 404);
+  }
+  assert.equal(records.get("appData"), JSON.stringify({ existing: true }));
+});

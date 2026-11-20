@@ -23,8 +23,14 @@ other app is rejected. Store numbers still identify
 support atomic updates: simultaneous changes can overwrite user or store
 updates, including during first-time migration. Back up KV before migration.
 Use the updated site and Worker together; older clients receive an app-selection
-error instead of accessing the wrong app's data. To import a JSON file
-into an existing store, replace `STORE_ID` with that store's ID:
+error instead of accessing the wrong app's data.
+
+The four app-specific Worker routes must end in `*` in the deployed route
+configuration: Cloudflare matches the entire URL, including its query string.
+The Worker rejects other paths caught by these wildcard prefixes.
+
+To import a JSON file into an existing store, replace `STORE_ID` with that
+store's ID:
 
 ```powershell
 wrangler kv key put --namespace-id=YOUR_ID "store:STORE_ID:christmasData" --path=./christmas.json

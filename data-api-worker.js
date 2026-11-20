@@ -389,7 +389,8 @@ async function handleSwitchStore(request, env, ctx) {
 //
 // Returns all stores the user has access to, including the store
 // name (pulled from each store's christmasData). The frontend uses
-// this to render the store picker dropdown.
+// this to render the store picker dropdown. Each user starts with
+// their own store at index 0; joining a store appends it to the list.
 //
 // Response includes no-cache, no-store, must-revalidate so the
 // store list is always fresh — if a user joins a new store, it
@@ -424,7 +425,7 @@ async function handleMyStores(request, env, ctx) {
     // Fetch each store's name from its christmasData in KV.
     // We use Promise.all to fetch all stores in parallel for speed.
     const stores = await Promise.all(
-      user.stores.map(async (storeId) => {
+      user.stores.map(async (storeId, index) => {
         const data = await env.DATA.get(`store:${storeId}:christmasData`);
         let name = `Store ${storeId}`;
         if (data) {
@@ -437,6 +438,7 @@ async function handleMyStores(request, env, ctx) {
           storeId,
           name,
           active: storeId === user.activeStore,
+          owned: index === 0,
         };
       })
     );

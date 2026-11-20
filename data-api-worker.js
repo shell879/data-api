@@ -10,8 +10,7 @@
 //   • /api/join-store  — Add a shared store to a user's account
 //   • /api/switch-store — Change the user's active store
 //   • /api/my-stores   — List all stores a user has access to
-//   • /api/christmas   — GET/POST per-user recipe data shared by the
-//                        Christmas and MyNutrition pages (scoped by store)
+//   • /api/christmas   — GET/POST active recipe data scoped by app and store
 //   • /api/data        — GET/POST shared app data (global, not per-user)
 //
 // Data is stored in Workers KV (env.DATA), keyed as:
@@ -45,6 +44,16 @@ export default {
           "Access-Control-Allow-Headers": "Content-Type",
         },
       });
+    }
+
+    if (["/api/christmas", "/api/my-stores", "/api/join-store", "/api/switch-store"].includes(url.pathname)) {
+      const app = url.searchParams.get("app");
+      if (app !== "recipeBuilder" && app !== "myNutrition") {
+        return Response.json(
+          { error: "An app selection is required. Refresh the page to use the latest version." },
+          { status: 400, headers: { "Access-Control-Allow-Origin": "*" } }
+        );
+      }
     }
 
     // ── Route: Image scan ───────────────────────────────────
@@ -103,14 +112,12 @@ export default {
     }
 
     // ── Route: Data storage (store recipes + shared catalog) ─
-    // GET/POST /api/christmas → per-user store recipes used by both the
-    // Christmas and MyNutrition pages. These are two views of the same data,
-    // not separate KV datasets.
+    // GET/POST /api/christmas → active store recipes for the selected app.
     // GET/POST /api/data      → shared global app data
     //
     // For /api/christmas, we look up the user's active store and
     // use "store:<storeId>:christmasData". The URL name is historical;
-    // the key is shared by both page experiences and isolated by store.
+    // separate app lists determine which stores are available.
     //
     // For everything else (e.g., /api/data), we use the shared
     // "appData" key — this is global data not tied to a specific user.
@@ -121,15 +128,34 @@ export default {
     // always revalidates with the origin before serving.
     let key;
     if (url.pathname === "/api/christmas") {
-      const storeId = await getUserStore(env, ctx, request);
-      key = `store:${storeId}:christmasData`;
+      try {
+        const { appState } = await getAppUser(env, ctx, request);
+        key = `store:${appState.activeStore}:christmasData`;
+      } catch (error) {
+        console.error("Could not load active store:", error);
+        return Response.json({ error: "Could not load active store", message: error.message }, {
+          status: 500, headers: { "Access-Control-Allow-Origin": "*" },
+        });
+      }
     } else {
       key = "appData";
     }
 
     // POST — write data to KV
     if (request.method === "POST") {
-      const body = await request.text();
+      let body = await request.text();
+      if (url.pathname === "/api/christmas") {
+        try {
+          const data = JSON.parse(body);
+          if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error("Expected an object");
+          data.appType = url.searchParams.get("app");
+          body = JSON.stringify(data);
+        } catch (error) {
+          return Response.json({ error: "Invalid recipe data", message: error.message }, {
+            status: 400, headers: { "Access-Control-Allow-Origin": "*" },
+          });
+        }
+      }
       await env.DATA.put(key, body);
       return new Response(JSON.stringify({ success: true, bytes: body.length }), {
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
@@ -156,154 +182,87 @@ export default {
 };
 
 // ──────────────────────────────────────────────────────────────
-// Helper: Get the user's active store ID
+// Helper: Load and initialize an app-specific store list
 // ──────────────────────────────────────────────────────────────
-// Identifies the user by email (via Access), then looks up their
-// user record in KV. Returns the activeStore ID.
-//
-// If the user doesn't have a record yet (first visit), creates one
-// with a new store ID and seeds it with empty recipe data so the
-// app doesn't get a 404 on first load.
-//
-// Also handles migration from the old data format (single storeId
-// field) to the new format (stores array + activeStore).
-async function getUserStore(env, ctx, request) {
-  let email = "guest";
-
-  // ── Try ctx.access (Cloudflare Access binding) ───────────
-  // This is the preferred method. When Access is enabled on the
-  // Worker, ctx.access.getIdentity() returns the authenticated
-  // user's identity object including their email.
-  if (ctx.access) {
-    try {
-      const identity = await ctx.access.getIdentity();
-      email = identity.email;
-    } catch {}
-  }
-
-  // ── Fallback: CF_Authorization cookie ────────────────────
-  // If ctx.access isn't available (e.g., Access isn't enabled on
-  // the Worker route), we can decode the Access JWT from the
-  // CF_Authorization cookie that Access sets in the browser.
-  // The JWT payload (middle segment, base64-decoded) contains
-  // the user's email.
-  if (email === "guest") {
-    const cookie = request.headers.get("Cookie") || "";
-    const cfAuth = cookie.match(/CF_Authorization=([^;]+)/);
-    if (cfAuth) {
-      try {
-        const payload = JSON.parse(atob(cfAuth[1].split(".")[1]));
-        email = payload.email || email;
-      } catch {}
-    }
-  }
-
-  // ── Fallback: Cf-Access-Jwt-Assertion header ─────────────
-  // Access also sends the JWT in a request header. Same decoding
-  // approach as the cookie fallback.
-  if (email === "guest") {
-    const jwt = request.headers.get("Cf-Access-Jwt-Assertion");
-    if (jwt) {
-      try {
-        const payload = JSON.parse(atob(jwt.split(".")[1]));
-        email = payload.email || email;
-      } catch {}
-    }
-  }
-
-  // ── Look up or create the user record in KV ──────────────
-  // Key format: "user:<email>"
-  // Value: { stores: [storeId, ...], activeStore: storeId, email, created }
+// Existing untyped stores belong to Recipe Builder.
+async function getAppUser(env, ctx, request) {
+  const app = new URL(request.url).searchParams.get("app");
+  const email = await getEmail(env, ctx, request);
   const userKey = `user:${email}`;
-  let userRecord = await env.DATA.get(userKey);
-
-  // First-time user: create a new record with one store
-  if (!userRecord) {
-    const storeId = Date.now();
-    userRecord = JSON.stringify({
-      stores: [storeId],
-      activeStore: storeId,
-      email,
-      created: new Date().toISOString(),
-    });
-    await env.DATA.put(userKey, userRecord);
-
-    // Seed the new store with empty recipe data so the app
-    // has a starting point instead of a 404
-    const emptyData = JSON.stringify({
-      stores: [{ id: 1, name: 'My Recipes', active: true, flavorProfiles: [] }],
+  const raw = await env.DATA.get(userKey);
+  const user = raw ? JSON.parse(raw) : { email, created: new Date().toISOString() };
+  let changed = !raw;
+  if (!user.apps) {
+    user.apps = {};
+    const legacyStores = Array.isArray(user.stores) ? user.stores : user.storeId ? [user.storeId] : [];
+    if (legacyStores.length) {
+      user.apps.recipeBuilder = {
+        stores: legacyStores,
+        activeStore: user.activeStore || legacyStores[0],
+      };
+    }
+    changed = true;
+  }
+  if (!user.apps[app]) {
+    const random = new Uint32Array(2);
+    crypto.getRandomValues(random);
+    const storeId = (random[0] & 0x1fffff) * 0x100000000 + random[1];
+    if (!storeId || await env.DATA.get(`store:${storeId}:christmasData`)) {
+      throw new Error("Could not allocate a unique store number. Please retry.");
+    }
+    const name = app === "myNutrition" ? `${email.split("@")[0]}MyNutritionStore` : "My Recipes";
+    await env.DATA.put(`store:${storeId}:christmasData`, JSON.stringify({
+      appType: app,
+      stores: [{ id: 1, name, active: true, flavorProfiles: [] }],
       categories: [],
       drinkRecipes: [],
-    });
-    await env.DATA.put(`store:${storeId}:christmasData`, emptyData);
+    }));
+    user.apps[app] = { stores: [storeId], activeStore: storeId };
+    changed = true;
   }
-
-  const user = JSON.parse(userRecord);
-
-  // ── Migrate old format ──────────────────────────────────
-  // Older user records used a single "storeId" field instead of
-  // the "stores" array. If we find the old format, migrate it
-  // to the new format and save.
-  if (!user.stores && user.storeId) {
-    user.stores = [user.storeId];
-    user.activeStore = user.storeId;
-    await env.DATA.put(userKey, JSON.stringify(user));
+  const appState = user.apps[app];
+  if (!Array.isArray(appState.stores) || !appState.stores.includes(appState.activeStore)) {
+    throw new Error("The app store list is invalid.");
   }
-
-  // Return the active store ID (or the first store if no active set)
-  return user.activeStore || user.stores[0];
+  if (changed) await env.DATA.put(userKey, JSON.stringify(user));
+  return { app, appState, user, userKey };
 }
 
 // ──────────────────────────────────────────────────────────────
 // Handler: Join a shared store
 // ──────────────────────────────────────────────────────────────
-// POST /api/join-store
+// POST /api/join-store?app=recipeBuilder|myNutrition
 // Body: { storeId: <number> }
 //
 // Adds the given storeId to the user's stores list and makes it
-// the active store. If the user already has this store, just
-// switches to it. The user must already exist in KV (created on
-// first visit via getUserStore).
+// the active store. A store can only be joined in its own app.
 async function handleJoinStore(request, env, ctx) {
   try {
     const body = await request.json();
     const storeId = Number(body.storeId);
-    if (!storeId) {
+    if (!Number.isSafeInteger(storeId) || storeId <= 0) {
       return Response.json(
         { error: "storeId required" },
         { status: 400, headers: { "Access-Control-Allow-Origin": "*" } }
       );
     }
 
-    const email = await getEmail(env, ctx, request);
-    const userKey = `user:${email}`;
-    let userRecord = await env.DATA.get(userKey);
-
-    if (!userRecord) {
-      return Response.json(
-        { error: "User not found" },
-        { status: 404, headers: { "Access-Control-Allow-Origin": "*" } }
-      );
+    const { app, appState, user, userKey } = await getAppUser(env, ctx, request);
+    const data = await env.DATA.get(`store:${storeId}:christmasData`);
+    if (!data) {
+      return Response.json({ error: "Store not found" }, { status: 404, headers: { "Access-Control-Allow-Origin": "*" } });
     }
-
-    const user = JSON.parse(userRecord);
-
-    // Migrate old format if needed (single storeId → stores array)
-    if (!user.stores && user.storeId) {
-      user.stores = [user.storeId];
-      user.activeStore = user.storeId;
+    const storeApp = JSON.parse(data).appType || "recipeBuilder";
+    if (storeApp !== app) {
+      return Response.json({ error: "This store belongs to a different app." }, { status: 403, headers: { "Access-Control-Allow-Origin": "*" } });
     }
-
-    // Add the store if the user doesn't already have it
-    if (!user.stores.includes(storeId)) {
-      user.stores.push(storeId);
-    }
-    user.activeStore = storeId;
+    if (!appState.stores.includes(storeId)) appState.stores.push(storeId);
+    appState.activeStore = storeId;
 
     await env.DATA.put(userKey, JSON.stringify(user));
 
     return Response.json(
-      { success: true, stores: user.stores, activeStore: user.activeStore },
+      { success: true, stores: appState.stores, activeStore: appState.activeStore },
       { headers: { "Access-Control-Allow-Origin": "*" } }
     );
   } catch (err) {
@@ -317,7 +276,7 @@ async function handleJoinStore(request, env, ctx) {
 // ──────────────────────────────────────────────────────────────
 // Handler: Switch active store
 // ──────────────────────────────────────────────────────────────
-// POST /api/switch-store
+// POST /api/switch-store?app=recipeBuilder|myNutrition
 // Body: { storeId: <number> }
 //
 // Changes the user's active store. The user must already have
@@ -331,41 +290,24 @@ async function handleSwitchStore(request, env, ctx) {
   try {
     const body = await request.json();
     const storeId = Number(body.storeId);
-    if (!storeId) {
+    if (!Number.isSafeInteger(storeId) || storeId <= 0) {
       return Response.json(
         { error: "storeId required" },
         { status: 400, headers: { "Access-Control-Allow-Origin": "*" } }
       );
     }
 
-    const email = await getEmail(env, ctx, request);
-    const userKey = `user:${email}`;
-    let userRecord = await env.DATA.get(userKey);
-
-    if (!userRecord) {
-      return Response.json(
-        { error: "User not found" },
-        { status: 404, headers: { "Access-Control-Allow-Origin": "*" } }
-      );
-    }
-
-    const user = JSON.parse(userRecord);
-
-    // Migrate old format if needed
-    if (!user.stores && user.storeId) {
-      user.stores = [user.storeId];
-      user.activeStore = user.storeId;
-    }
+    const { appState, user, userKey } = await getAppUser(env, ctx, request);
 
     // Security check: user must already have access to this store
-    if (!user.stores.includes(storeId)) {
+    if (!appState.stores.includes(storeId)) {
       return Response.json(
         { error: "You don't have access to this store" },
         { status: 403, headers: { "Access-Control-Allow-Origin": "*" } }
       );
     }
 
-    user.activeStore = storeId;
+    appState.activeStore = storeId;
     await env.DATA.put(userKey, JSON.stringify(user));
 
     return Response.json(
@@ -388,7 +330,7 @@ async function handleSwitchStore(request, env, ctx) {
 // ──────────────────────────────────────────────────────────────
 // Handler: List user's stores with names
 // ──────────────────────────────────────────────────────────────
-// GET /api/my-stores
+// GET /api/my-stores?app=recipeBuilder|myNutrition
 //
 // Returns all stores the user has access to, including the store
 // name (pulled from each store's christmasData). The frontend uses
@@ -400,35 +342,12 @@ async function handleSwitchStore(request, env, ctx) {
 // shows up immediately on the next request.
 async function handleMyStores(request, env, ctx) {
   try {
-    const email = await getEmail(env, ctx, request);
-    const userKey = `user:${email}`;
-    let userRecord = await env.DATA.get(userKey);
-
-    // No user record yet → return empty store list
-    if (!userRecord) {
-      return Response.json(
-        { stores: [] },
-        {
-          headers: {
-            "Access-Control-Allow-Origin": "*",
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-          },
-        }
-      );
-    }
-
-    const user = JSON.parse(userRecord);
-
-    // Migrate old format if needed
-    if (!user.stores) {
-      user.stores = [user.storeId];
-      user.activeStore = user.storeId;
-    }
+    const { appState } = await getAppUser(env, ctx, request);
 
     // Fetch each store's name from its christmasData in KV.
     // We use Promise.all to fetch all stores in parallel for speed.
     const stores = await Promise.all(
-      user.stores.map(async (storeId, index) => {
+      appState.stores.map(async (storeId, index) => {
         const data = await env.DATA.get(`store:${storeId}:christmasData`);
         let name = `Store ${storeId}`;
         if (data) {
@@ -440,7 +359,7 @@ async function handleMyStores(request, env, ctx) {
         return {
           storeId,
           name,
-          active: storeId === user.activeStore,
+          active: storeId === appState.activeStore,
           owned: index === 0,
         };
       })
@@ -448,7 +367,7 @@ async function handleMyStores(request, env, ctx) {
 
     return Response.json(
       { stores },
-      { headers: { "Access-Control-Allow-Origin": "*" } }
+      { headers: { "Access-Control-Allow-Origin": "*", "Cache-Control": "no-store" } }
     );
   } catch (err) {
     return Response.json(
